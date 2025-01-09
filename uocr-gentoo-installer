@@ -1,0 +1,612 @@
+#!/bin/bash
+# SPDX-License-Identifer: GPL-3.0-or-later
+# Copyright (C) 2024 Nick Kossifidis <mickflemm@gmail.com>
+
+# Minimum size of block device in GiB
+MIN_TOT_SIZE=80.0
+
+LOGFILE=/tmp/uocr_installer_log_$$
+PREFIX=/mnt/gentoo
+
+##################
+# CONSOLE OUTPUT #
+##################
+
+function pr_ann () {
+	echo -e "\e[32m \n--=== ${1} ===--\e[0m"
+	echo -e "\e[32m \n--=== ${1} ===--\e[0m" &> ${LOGFILE}
+}
+
+function pr_inf () {
+	echo -e "\e[36m${1}\e[0m"
+	echo -e "\e[36m${1}\e[0m" &> ${LOGFILE}
+}
+
+function pr_wrn () {
+	echo -e "\e[33m\t${1}\e[0m"
+}
+
+function pr_err () {
+	>&2 echo -e "\e[31m${1}\e[0m"
+	echo -e "\e[31m${1}\e[0m" &> ${LOGFILE}
+}
+
+################
+# EXIT HANDLER #
+################
+
+function exit_handler () {
+	local EXIT_CODE=$?
+	if [[ ${EXIT_CODE} != 0 ]]; then
+		pr_err "Exited with code: ${EXIT_CODE}"
+		pr_err "Check log at ${LOGFILE}"
+	fi
+	exit ${EXIT_CODE}
+}
+
+trap exit_handler EXIT
+
+###########
+# HELPERS #
+###########
+
+function usage () {
+	echo "Usage:"
+	echo "$0 <block device>"
+}
+
+function less_than () {
+	local RESULT=$(awk -v n1=${1} -v n2=${2} 'BEGIN {printf (n1<n2?"0":"1")}')
+	$(exit ${RESULT})
+}
+
+function run_in_chroot() {
+	chroot ${PREFIX} $@
+}
+
+function fontconfig_enable () {
+	for i in `run_in_chroot eselect fontconfig list | grep ${1} | awk '{print $1}' |  sed 's/^.//;s/.$//'`; do
+		run_in_chroot eselect fontconfig enable ${i}
+	done
+}
+
+##########################
+# STORAGE INITIALIZATION #
+##########################
+
+function get_storage_info () {
+	local TOT_SIZE=$(sgdisk -p ${1} | grep "Disk ${1}" | awk -F": " '{print $2}' | awk -F " sectors, " '{print $2}')
+	local TOT_FREE=$(sgdisk -p ${1} | grep "Total free space" | awk -F "sectors " '{print $2}' | sed 's/^.//;s/.$//')
+
+	if [[ ${TOT_FREE} != ${TOT_SIZE} ]]; then
+		pr_err "Disk already has allocated partitions"
+		exit 2
+	fi
+
+	# Check if size is in GiB or TiB, convert to GiB
+	if echo ${TOT_SIZE} | grep "GiB" &> /dev/null; then
+		TOT_SIZE=$(echo ${TOT_SIZE} | awk '{print $1}')
+	elif echo ${TOT_SIZE} | grep "TiB" &> /dev/null; then
+		TOT_SIZE=$(echo ${TOT_SIZE} | awk '{print $1*1024}')
+		TOT_SIZE=$(echo ${TOT_SIZE} | awk '{print $1}')
+	else
+		pr_err "Invalid size: ${TOT_SIZE}"
+		exit 3
+	fi
+
+	if $(less_than ${TOT_SIZE} ${MIN_TOT_SIZE}); then
+		pr_err "Not enough space on ${1}"
+		exit 4
+	fi
+
+	eval ${2}="${TOT_SIZE}"
+}
+
+function get_esp_size () {
+	# We want /boot to also be the ESP so that we can boot kernels
+	# directly as EFI stubs without a boot loader if we chose to do
+	# so, hence it needs to be fairly large. Apple recommends 200M,
+	# gptdisk recommends 512M due to some old buggy firmware
+	# implementations and dosfstools behavior of formatting
+	# anything < 512M as FAT16 by default etc, Gentoo recommends
+	# 1G so that it can hold multiple kernel images / OSes,
+	# Arch recommends 300M. I've used 200M for dual booting and it
+	# was more than enough, also with a backup kernel, but I guess
+	# 300M is ok, 512M/1G is a bit too much IMHO.
+	echo "300M"
+}
+
+function get_rootpart_size () {
+	local TOT_SIZE=${1}
+
+	# In most systems 15-20GB are more than enough for rootfs.
+	# Workstations with lots of tools/libs etc may go up to
+	# 40GB, I've never been able to get more than 60GB used
+	# in rootfs no matter how much stuff I installed. Note that
+	# one can always mount /opt elsewhere for out-of-tree stuff
+	# such as proprietary tools etc. The only requirement here
+	# is to be able to fit /{root,etc,usr} basically (recall
+	# that we use merged-usr so /lib,bin,sbin are symlinks
+	# to /usr/lib,bin,sbin etc). Just to be safe here and
+	# future-proof, and assume that the user will e.g. install
+	# multiple desktop environments etc, I'll go for a maximum
+	# of 80G and scale down from there.
+
+	if $(less_than ${TOT_SIZE}  "100.0"); then
+		echo "20G"
+	elif $(less_than ${TOT_SIZE}  "128.0"); then
+		echo "30G"
+	elif $(less_than ${TOT_SIZE}  "256.0"); then
+		echo "40G"
+	elif $(less_than ${TOT_SIZE}  "512.0"); then
+		echo "60G"
+	else
+		echo "80G"
+	fi
+}
+
+function get_varpart_size () {
+	local TOT_SIZE=${1}
+
+	# In most systems 8-12GB are more than enough for var.
+	# The var subfolders can be mounted elsewhere obviously so
+	# we can always extend this later on if needed, if for example
+	# there is no space for compiling packages in /var/tmp/portage
+	# (which should be in tmpfs anyway for most packages), or for
+	# lxc containers etc. Since I don't want to over-complicate
+	# things, and the largest /var I've seen on a binhost (where
+	# all binary packages are stored on var) is 30G I'll assume
+	# a maximum of 40G and scale down from there.
+
+	if $(less_than ${TOT_SIZE}  "100.0"); then
+		echo "8G"
+	elif $(less_than ${TOT_SIZE}  "128.0"); then
+		echo "12G"
+	elif $(less_than ${TOT_SIZE}  "256.0"); then
+		echo "18G"
+	elif $(less_than ${TOT_SIZE}  "512.0"); then
+		echo "26G"
+	else
+		echo "40G"
+	fi
+}
+
+function get_swappart_size () {
+	# This is tricky, the recommendation here is usualy 2*RAM size
+	# but this is to support hibernation which is not a common
+	# scenario and can also be achieved with a swapfile on systems
+	# that need it. Wasting e.g. 16 or 32G for this doesn't make sense
+	# to me, not to mention that user may add more RAM in the future.
+	# Not only that but the larger the memory, the less swap space is
+	# needed, swap space should depend on RAM utilization, not size.
+	# Redhat has a recommendation for swap size and assuming that
+	# newer systems have 8GB of RAM or more, I'll stick to 8GB.
+	# Systems with more than 8GB of RAM will probably need less swap
+	# than 8GB but anyway.
+	echo "8G"
+}
+
+function partition_storage () {
+	local BDEV=${1}
+	local BDEV_SIZE
+	get_storage_info ${BDEV} BDEV_SIZE
+
+	pr_ann "Partitioning storage device"
+
+	pr_inf "Creating new GPT"
+	sgdisk -og ${BDEV} &> ${LOGFILE}
+
+	pr_inf "Creating ESP"
+	local BOOT_PART_SIZE=$(get_esp_size)
+	sgdisk -n 1:0:+${BOOT_PART_SIZE} -t 1:ef00 -c 1:"EFI System Partition" ${BDEV} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 5
+	fi
+
+	pr_inf "Creating Root partition"
+	local ROOT_PART_SIZE=$(get_rootpart_size ${BDEV_SIZE})
+	sgdisk -n 2:0:+${ROOT_PART_SIZE} -t 2:8304 -c 2:"Root Partition (amd64/x86_64)" ${BDEV} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 6
+	fi
+
+	pr_inf "Creating Var partition"
+	local VAR_PART_SIZE=$(get_varpart_size ${BDEV_SIZE})
+	sgdisk -n 3:0:+${VAR_PART_SIZE} -t 3:8310 -c 3:"Variable Data Partition" ${BDEV} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 7
+	fi
+
+	pr_inf "Creating swap partition"
+	local SWAP_PART_SIZE=$(get_swappart_size)
+	sgdisk -n 4:0:+${SWAP_PART_SIZE} -t 4:8200 -c 4:"Swap" ${BDEV} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 8
+	fi
+
+	pr_inf "Creating home partition"
+	sgdisk -n 5:0:-0 -t 5:8302 -c 5:"Home Partition" ${BDEV} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 9
+	fi
+
+	pr_ann "Partition table done"
+	sgdisk -p ${BDEV}
+
+}
+
+function format_storage () {
+	local BDEV=${1}
+	local BDEV_PARTS=()
+	readarray -t BDEV_PARTS < <(lsblk -P ${BDEV} | grep part | awk '{print $1}' | awk -F"=" '{print $2}' | sed 's/^.//;s/.$//')
+
+	pr_ann "Formatting partitions"
+
+	pr_inf "Formatting ESP"
+	mkfs.fat -F 32 /dev/${BDEV_PARTS[0]} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 10
+	fi
+
+	pr_inf "Formatting Root Partition"
+	mkfs.ext4 -L "GentooRootfs" -q /dev/${BDEV_PARTS[1]} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 11
+	fi
+
+	pr_inf "Formatting Var Partition"
+	mkfs.ext4 -L "GentooVar" -q /dev/${BDEV_PARTS[2]} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 12
+	fi
+
+	pr_inf "Formatting Swap partition"
+	mkswap -L "GentooSwap" /dev/${BDEV_PARTS[3]} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 13
+	fi
+
+	pr_inf "Formatting Home partition"
+	mkfs.ext4 -L "GentooHome" -q /dev/${BDEV_PARTS[4]} &> ${LOGFILE}
+	if [[ $? != 0 ]]; then
+		exit 14
+	fi
+
+}
+
+function mount_storage () {
+	local BDEV=${1}
+	local BDEV_PARTS=()
+	readarray -t BDEV_PARTS < <(lsblk -P ${BDEV} | grep part | awk '{print $1}' | awk -F"=" '{print $2}' | sed 's/^.//;s/.$//')
+
+	pr_ann "Mounting partitions under ${PREFIX}"
+
+	pr_inf "Mounting Root partition"
+	mount /dev/${BDEV_PARTS[1]} ${PREFIX}
+	if [[ $? != 0 ]]; then
+		exit 15
+	fi
+
+	pr_inf "Mounting ESP"
+	mkdir -p ${PREFIX}/boot
+	# Make sure the mountpoint itself always remains empty for systemd's
+	# system-gpt-autogenerator to work as expected (and to catch bugs)
+	chmod ugo-w ${PREFIX}/boot
+	chattr +i ${PREFIX}/boot
+	mount /dev/${BDEV_PARTS[0]} ${PREFIX}/boot
+	if [[ $? != 0 ]]; then
+		exit 16
+	fi
+
+	pr_inf "Mounting Var"
+	mkdir -p ${PREFIX}/var
+	chmod ugo-w ${PREFIX}/var
+	chattr +i ${PREFIX}/var
+	mount /dev/${BDEV_PARTS[2]} ${PREFIX}/var
+	if [[ $? != 0 ]]; then
+		exit 17
+	fi
+
+	pr_inf "Mounting Home"
+	mkdir -p ${PREFIX}/home
+	chmod ugo-w ${PREFIX}/home
+	chattr +i ${PREFIX}/home
+	mount /dev/${BDEV_PARTS[4]} ${PREFIX}/home
+	if [[ $? != 0 ]]; then
+		exit 18
+	fi
+
+}
+
+function prep_storage () {
+	partition_storage ${1}
+	format_storage ${1}
+	mount_storage ${1}
+}
+
+#################
+# INITIAL SETUP #
+#################
+
+function unpack_stage3 () {
+	local MIRROR_URL="http://ftp.ntua.gr/pub/linux/gentoo/releases/amd64/autobuilds"
+	local STAGE3_PATH=$(curl ${MIRROR_URL}/latest-stage3-amd64-nomultilib-systemd.txt -s | grep -v "#" | grep -e "\.tar" | awk '{print $1}')
+	local SAVED_PWD=${PWD}
+
+	pr_ann "Installing stage3 (no-multilib, systemd, merged-usr)"
+
+	pr_inf "Syncing time"
+	chronyd -q &> ${LOGFILE}
+
+	pr_inf "Downloading tarball"
+	cd ${PREFIX}
+	wget -nv --show-progress ${MIRROR_URL}/${STAGE3_PATH}
+
+	pr_inf "Unpacking tarball"
+	tar xpvf stage3-*.tar.xz --xattrs-include='*.*' --numeric-owner &> ${LOGFILE}
+
+	pr_inf "Cleaning up"
+	local STAGE3_FILENAME=$(echo ${STAGE3_PATH} | awk -F"/" '{print $2}')
+	rm ${STAGE3_FILENAME} &> ${LOGFILE}
+
+	cd ${SAVED_PWD}
+}
+
+function prepare_chroot () {
+	pr_ann "Setting up chroot environment"
+
+	pr_inf "Copying resolv.conf"
+	cp --dereference /etc/resolv.conf ${PREFIX}/etc/
+
+	pr_inf "Mounting /proc"
+	mount -t proc none ${PREFIX}/proc
+
+	pr_inf "Mounting /dev"
+	mount --rbind /dev ${PREFIX}/dev
+	mount --make-rslave ${PREFIX}/dev
+
+	pr_inf "Mounting /sys"
+	mount --rbind /sys ${PREFIX}/sys
+	mount --make-rslave ${PREFIX}/sys
+
+	pr_inf "Mounting /run"
+	mount --rbind /run ${PREFIX}/run
+	mount --make-rslave ${PREFIX}/run
+}
+
+function initial_setup () {
+	pr_ann "Initial setup"
+
+	pr_inf "Generating machine-id"
+	run_in_chroot systemd-machine-id-setup
+
+	pr_inf "Fetching portage tree"
+	run_in_chroot emerge-webrsync -q
+
+	pr_inf "Selecting initial profile"
+	PROFILE_ID=$(chroot ${PREFIX} eselect profile list | grep "default/linux/amd64/23.0/no-multilib/systemd" | awk '{print $1}' | sed 's/^.//;s/.$//')
+	run_in_chroot eselect profile set ${PROFILE_ID}
+
+#	pr_inf "Updating packages"
+#	run_in_chroot emerge -uDN --quiet --jobs=$(nproc) world
+
+	pr_inf "Installing some temporary packages"
+	run_in_chroot emerge -1 --quiet --jobs=$(nproc) dev-vcs/git eselect-repository app-portage/getuto
+
+	pr_inf "Running getuto to setup local trust anchor"
+	run_in_chroot getuto
+
+	pr_inf "Installing uoc-overlay"
+	run_in_chroot eselect repository add uoc-radio git https://github.com/UoC-Radio/uoc-radio-overlay.git
+	run_in_chroot emaint sync -r uoc-radio
+
+	pr_inf "Switching to uoc-radio:amd64-desktop profile"
+	PROFILE_ID=$(chroot ${PREFIX} eselect profile list | grep "uoc-radio:amd64-desktop" | awk '{print $1}' | sed 's/^.//;s/.$//')
+	run_in_chroot eselect profile set ${PROFILE_ID}
+
+	pr_inf "Adding studiouser"
+cat << EOF | chroot ${PREFIX} /bin/bash
+	source /etc/profile
+	emerge -uDN1 studiouser --with-bdeps=y
+EOF
+
+	pr_inf "Updating make.conf"
+	echo "FEATURES=\"getbinpkg\"" >> ${PREFIX}/etc/portage/make.conf
+	echo "PORTAGE_BINHOST=\"https://riscv.ics.forth.gr/uocr/packages\"" >> ${PREFIX}/etc/portage/make.conf
+	echo "GENTOO_MIRRORS=\"http://ftp.ntua.gr/pub/linux/gentoo/\"" >> ${PREFIX}/etc/portage/make.conf
+	echo "EMERGE_DEFAULT_OPTS=\"--binpkg-changed-deps=n --binpkg-respect-use=n --jobs=$(nproc)\"" >> ${PREFIX}/etc/portage/make.conf
+
+	pr_inf "Updating locale.gen"
+	echo "en_US ISO-8859-1" > ${PREFIX}/etc/locale.gen
+	echo "en_US.UTF-8 UTF-8" >> ${PREFIX}/etc/locale.gen
+	echo "el_GR.UTF-8 UTF-8" >> ${PREFIX}/etc/locale.gen
+
+	pr_ann "Switching to UoC Radio distro"
+	pr_inf "Fetching system set, sit back and relax"
+cat << EOF | chroot ${PREFIX} /bin/bash
+	source /etc/profile
+	emerge -uDN1 freetype harfbuzz --nodeps
+	emerge -uDN world --with-bdeps=y --jobs=$(nproc)
+EOF
+
+	pr_inf "Cleaning up"
+	run_in_chroot emerge --depclean
+
+	pr_inf "Updating eix cache"
+	run_in_chroot eix-update
+}
+
+function post_install () {
+	pr_ann "Running post-install config"
+
+	pr_inf "Setting timezone to Europe/Athens"
+	ln -sf ../usr/share/zoneinfo/Europe/Athens ${PREFIX}/etc/localtime
+
+	pr_inf "Enabling NetworkManager"
+	run_in_chroot systemctl enable NetworkManager
+
+	pr_inf "Enabling GDM"
+	run_in_chroot systemctl set-default graphical.target
+	run_in_chroot systemctl enable gdm
+
+	pr_inf "Enabling OpenSSH"
+	run_in_chroot systemctl enable sshd
+
+	pr_inf "Enabling bluetooth service"
+	run_in_chroot systemctl enable bluetooth
+
+	pr_inf "Generating locales"
+	run_in_chroot locale-gen
+
+	pr_inf "Updating fontconfig"
+	fontconfig_enable noto
+	fontconfig_enable google-droid
+
+	pr_inf "Enabling pipewire for studiouser"
+#	run_in_chroot su studiouser -c "systemctl \-\-user enable pipewire.socket pipewire-pulse.socket"
+	mkdir -p ${PREFIX}/home/studiouser/.config/systemd/user/
+	mkdir -p ${PREFIX}/home/studiouser/.config/systemd/user/sockets.target.wants/
+	ln -s /usr/lib/systemd/user/pipewire.socket ${PREFIX}/home/studiouser/.config/systemd/user/sockets.target.wants/
+	ln -s /usr/lib/systemd/user/pipewire-pulse.socket ${PREFIX}/home/studiouser/.config/systemd/user/sockets.target.wants/
+#	run_in_chroot su studiouser -c  "systemctl \-\-user \-\-force enable wireplumber.service"
+	ln -s /usr/lib/systemd/user/wireplumber.service ${PREFIX}/home/studiouser/.config/systemd/user/pipewire-session-manager.service
+	mkdir -p ${PREFIX}/home/studiouser/.config/systemd/user/pipewire.service.wants/
+	ln -s /usr/lib/systemd/user/wireplumber.service ${PREFIX}/home/studiouser/.config/systemd/user/pipewire.service.wants/
+	run_in_chroot chown -R studiouser:users /home/studiouser/
+
+	pr_inf "Enabling access to cpu_dma_latency interface for audio group"
+	echo "DEVPATH==\"/devices/virtual/misc/cpu_dma_latency\", OWNER=\"root\", GROUP=\"audio\", MODE=\"0660\"" > ${PREFIX}/etc/udev/rules.d/99-cpu-dma-latency.rules
+
+	mkdir -p ${PREFIX}/etc/geoclue/conf.d
+#TODO: More...
+
+}
+
+function install_bootloader () {
+	pr_ann "Installing bootloader (systemd-boot)"
+
+	pr_inf "Creating /boot/EFI folder"
+	mkdir -p ${PREFIX}/boot/EFI
+
+	pr_inf "Creating /efi"
+	mkdir -p ${PREFIX}/efi
+
+	pr_inf "Installing bootloader"
+	run_in_chroot bootctl --esp-path=/boot install
+
+	pr_inf "Updating bootloader config"
+	echo "timeout 3" > ${PREFIX}/boot/loader/loader.conf
+	echo "console-mode keep" >> ${PREFIX}/boot/loader/loader.conf
+	echo "editor no" >> ${PREFIX}/boot/loader/loader.conf
+}
+
+function install_kernel () {
+	local BDEV=${1}
+	local BDEV_PARTS=()
+	readarray -t BDEV_PARTS < <(lsblk -P ${BDEV} | grep part | awk '{print $1}' | awk -F"=" '{print $2}' | sed 's/^.//;s/.$//')
+
+	pr_ann "Installing kernel"
+
+	pr_inf "Creating /etc/kernel/cmdline"
+	local ROOT_PARTUUID=$(blkid /dev/${BDEV_PARTS[1]} -s PARTUUID | awk -F"=" '{print $2}' | sed 's/^.//;s/.$//')
+	echo "root=PARTUUID=${ROOT_PARTUUID}" > ${PREFIX}/etc/kernel/cmdline
+	echo "rootfstype=ext4" >> ${PREFIX}/etc/kernel/cmdline
+	echo "quiet" >> ${PREFIX}/etc/kernel/cmdline
+	echo "threadirqs" >> ${PREFIX}/etc/kernel/cmdline
+	echo "mitigations=off" >> ${PREFIX}/etc/kernel/cmdline
+	echo "preempt=full" >> ${PREFIX}/etc/kernel/cmdline
+
+	pr_inf "Installing gentoo-kernel"
+	run_in_chroot emerge --quiet -uDN gentoo-kernel
+}
+
+function prep_first_boot () {
+	local BDEV=${1}
+	pr_ann "Get ready for first boot"
+
+	pr_inf "Updating Var Partition's PARTUUID"
+	local VAR_PARTUUID=$(run_in_chroot systemd-id128 -u --app-specific=4d21b016-b534-45c2-a9fb-5c16e091fd2d machine-id)
+	sgdisk --partition-guid=3:${VAR_PARTUUID} ${BDEV}
+
+	pr_inf "Setting temp root password to uocr"
+	sed -i 's/everyone/none/g' ${PREFIX}/etc/security/passwdqc.conf
+	echo "root:uocr" | run_in_chroot chpasswd &> /dev/null
+	run_in_chroot passwd --expire root
+	sed -i 's/none/everyone/g' ${PREFIX}/etc/security/passwdqc.conf
+
+	pr_inf "Setting temp studiouser password to uocr"
+	sed -i 's/everyone/none/g' ${PREFIX}/etc/security/passwdqc.conf
+	echo "studiouser:uocr" | run_in_chroot chpasswd &> /dev/null
+	run_in_chroot passwd --expire studiouser
+	sed -i 's/none/everyone/g' ${PREFIX}/etc/security/passwdqc.conf
+}
+
+function cleanup () {
+	pr_ann "Cleaning up"
+
+	pr_inf "Unmounting ${PREFIX}"
+
+	pr_inf "Unmounting /proc"
+	for i in $(mount | grep ${PREFIX}/proc | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount ${PREFIX}/proc &> /dev/null
+
+	pr_inf "Unmounting /dev"
+	for i in $(mount | grep ${PREFIX}/dev | awk '{print $3}'); do
+                umount ${i} &> /dev/null
+        done
+	umount ${PREFIX}/dev &> /dev/null
+
+	pr_inf "Unmounting /sys"
+	for i in $(mount | grep ${PREFIX}/sys | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+
+	pr_inf "Unmounting /run"
+	for i in $(mount | grep ${PREFIX}/run | awk '{print $3}'); do
+		umount ${i} &> /dev/null
+	done
+	umount ${PREFIX}/run
+
+	pr_inf "Unmounting /home"
+	umount ${PREFIX}/home
+
+	pr_inf "Unmounting /var"
+	umount ${PREFIX}/var
+
+	pr_inf "Unmounting /boot"
+	umount ${PREFIX}/boot
+
+	umount -R ${PREFIX}
+	sync;sync
+
+	pr_wrn "Remember after reboot to do the following:"
+	pr_wrn "a) Change root/studiouser password (you'll be forced to on your first login"
+	pr_wrn "b) Run systemd-firstboot"
+	pr_wrn "c) Run timedatectl and verify time is correct, enable NTP sync"
+}
+
+function distro_setup () {
+	unpack_stage3
+	prepare_chroot
+	initial_setup
+	post_install
+	install_bootloader
+	install_kernel ${1}
+	prep_first_boot ${1}
+	cleanup
+}
+
+if [[ $# != 1 ]]; then
+	usage
+	exit 1
+fi
+
+if [[ ! -b ${1} ]]; then
+	echo "Argument is not a block device"
+	exit 2
+fi
+
+prep_storage ${1}
+distro_setup ${1}
